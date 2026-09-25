@@ -1230,8 +1230,17 @@ impl PeerConnection {
         }
         transceiver.set_receiver(Some(receiver));
 
-        let mut list = self.inner.transceivers.lock();
-        list.push(transceiver.clone());
+        self.inner.transceivers.lock().push(transceiver.clone());
+
+        // If the transport is already up (renegotiation), record it so a sender
+        // installed later via set_sender is connected. Direct RTP records it
+        // once the remote description selects the media transport.
+        if matches!(kind, MediaKind::Audio | MediaKind::Video)
+            && self.inner.config.transport_mode != TransportMode::Rtp
+            && let Some(transport) = self.inner.rtp_transport.lock().as_ref()
+        {
+            transceiver.set_rtp_transport(Arc::downgrade(transport));
+        }
         transceiver
     }
 
@@ -1500,6 +1509,22 @@ impl PeerConnection {
             }
         }
         let applies_answer = matches!(desc.sdp_type, SdpType::Answer | SdpType::Pranswer);
+        // The offer is accepted and its MIDs are assigned. It states our own
+        // direction: keep that as our preference, unless it is just what
+        // create_offer derived from the preference.
+        if desc.sdp_type == SdpType::Offer {
+            let transceivers = self.inner.transceivers.lock().clone();
+            for section in &desc.media_sections {
+                if let Some(t) = transceivers
+                    .iter()
+                    .find(|t| t.mid().as_deref() == Some(section.mid.as_str()))
+                {
+                    t.record_offered_direction(section.direction.into());
+                }
+            }
+        }
+        // Store through a temporary guard: apply_negotiated_send_directions
+        // re-locks local_description, so no guard may be held across it.
         *self.inner.local_description.lock() = Some(desc);
         if applies_answer {
             self.apply_negotiated_send_directions();
@@ -1969,7 +1994,7 @@ impl PeerConnection {
                     let extmap = Self::extract_extmap(section);
                     let _ = t.update_extmap(extmap);
                     let direction: TransceiverDirection = section.direction.into();
-                    t.set_direction(direction);
+                    t.set_remote_direction(direction);
 
                     if let Some(ssrc_val) = ssrc
                         && let Some(rx) = t.receiver.lock().as_ref()
@@ -2001,6 +2026,10 @@ impl PeerConnection {
                     let kind = section.kind;
                     let direction: TransceiverDirection = section.direction.into();
                     let t = Arc::new(RtpTransceiver::new(kind, direction));
+                    // Created by the remote offer: we have not expressed a
+                    // preference, so offer sendrecv (downgraded while we have
+                    // no sender) rather than mirroring the remote's direction.
+                    *t.desired_direction.lock() = TransceiverDirection::SendRecv;
                     t.set_mid(mid.clone());
 
                     let receiver_ssrc = ssrc.unwrap_or(0);
@@ -2053,6 +2082,9 @@ impl PeerConnection {
                     if self.inner.config.transport_mode != TransportMode::Rtp {
                         let transport_guard = self.inner.rtp_transport.lock();
                         if let Some(transport) = &*transport_guard {
+                            // Record it on the transceiver too, so a sender
+                            // installed later via set_sender is connected.
+                            t.set_rtp_transport(Arc::downgrade(transport));
                             receiver.set_transport(
                                 transport.clone(),
                                 Some(self.inner.event_tx.clone()),
@@ -2120,7 +2152,7 @@ impl PeerConnection {
                 let extmap = Self::extract_extmap(section);
                 let _ = t.update_extmap(extmap);
                 let direction: TransceiverDirection = section.direction.into();
-                t.set_direction(direction);
+                t.set_remote_direction(direction);
 
                 let mut ssrc = None;
                 for attr in &section.attributes {
@@ -3809,7 +3841,7 @@ impl PeerConnection {
                     "Direction changed for mid={}: {:?} -> {:?}",
                     section.mid, old_direction, new_direction
                 );
-                t.set_direction(new_direction);
+                t.set_remote_direction(new_direction);
                 Self::apply_direction_change(&t, old_direction, new_direction).await?;
             }
         }
@@ -4953,6 +4985,7 @@ impl PeerConnectionInner {
                         t,
                         section.attributes.iter().any(|attr| attr.key == "rtcp-mux"),
                         section_rejected(remote, section),
+                        Some(TransceiverDirection::from(section.direction)),
                     ));
                 } else {
                     return Err(RtcError::Internal(format!(
@@ -4982,7 +5015,10 @@ impl PeerConnectionInner {
                     _ => mid_a.cmp(&mid_b),
                 }
             });
-            ordered.into_iter().map(|t| (t, false, false)).collect()
+            ordered
+                .into_iter()
+                .map(|t| (t, false, false, None))
+                .collect()
         };
 
         let mode = self.config.transport_mode.clone();
@@ -5046,11 +5082,23 @@ impl PeerConnectionInner {
             IceGathererState::Complete
         );
         let mut desc = SessionDescription::new(sdp_type);
-        desc.session.origin = default_origin();
-        if let Some(ext_ip) = &self.config.external_ip {
-            desc.session.origin.unicast_address = ext_ip.clone();
+        // RFC 3264 §8, RFC 8829 §5.2.2 / §5.3.2: after the first description,
+        // keep the previous local o= line and increment its version by one.
+        let previous_origin = self
+            .local_description
+            .lock()
+            .as_ref()
+            .map(|previous| previous.session.origin.clone());
+        if let Some(mut origin) = previous_origin {
+            origin.session_version = origin.session_version.wrapping_add(1);
+            desc.session.origin = origin;
+        } else {
+            desc.session.origin = default_origin();
+            if let Some(ext_ip) = &self.config.external_ip {
+                desc.session.origin.unicast_address = ext_ip.clone();
+            }
+            desc.session.origin.session_version += 1;
         }
-        desc.session.origin.session_version += 1;
         if !desc
             .session
             .attributes
@@ -5071,11 +5119,21 @@ impl PeerConnectionInner {
             desc.session.connection = Some(format!("IN IP4 {}", ext_ip));
         }
 
-        for (media_index, (transceiver, remote_offered_rtcp_mux, offer_rejected)) in
-            ordered_transceivers.into_iter().enumerate()
+        for (
+            media_index,
+            (transceiver, remote_offered_rtcp_mux, offer_rejected, offered_direction),
+        ) in ordered_transceivers.into_iter().enumerate()
         {
             let mid = self.ensure_mid(&transceiver);
-            let mut direction = map_direction(transceiver.direction());
+            // An offer expresses our own willingness to send/receive, so it
+            // starts from our preferred direction. An answer is the reverse of
+            // the direction the remote offered, limited to what we want
+            // (RFC 3264 §6.1, RFC 8829 §5.3.1).
+            let mut direction = match offered_direction {
+                // The remote m= section this answer section answers.
+                Some(offered) => map_direction(offered).intersect(transceiver.desired_direction()),
+                None => map_direction(transceiver.desired_direction()),
+            };
             let sender_info = if direction.sends() {
                 transceiver.sender.lock().clone()
             } else {
@@ -6171,6 +6229,26 @@ impl TransceiverDirection {
             TransceiverDirection::SendRecv | TransceiverDirection::SendOnly
         )
     }
+
+    fn receives(self) -> bool {
+        matches!(
+            self,
+            TransceiverDirection::SendRecv | TransceiverDirection::RecvOnly
+        )
+    }
+
+    /// The direction that both `self` and `other` allow.
+    fn intersect(self, other: Self) -> Self {
+        match (
+            self.sends() && other.sends(),
+            self.receives() && other.receives(),
+        ) {
+            (true, true) => TransceiverDirection::SendRecv,
+            (true, false) => TransceiverDirection::SendOnly,
+            (false, true) => TransceiverDirection::RecvOnly,
+            (false, false) => TransceiverDirection::Inactive,
+        }
+    }
 }
 
 impl From<TransceiverDirection> for Direction {
@@ -6225,6 +6303,12 @@ pub struct RtpTransceiver {
     id: u64,
     kind: MediaKind,
     direction: Mutex<TransceiverDirection>,
+    /// Our own preferred direction, used when we generate an offer (JSEP
+    /// `transceiver.direction`). Set at creation and by [`Self::set_direction`];
+    /// applying a remote description updates `direction` but never this, so a
+    /// re-offer expresses our willingness rather than echoing the remote's
+    /// (RFC 3264 §6.1, RFC 6337 §5.3).
+    desired_direction: Mutex<TransceiverDirection>,
     mid: Mutex<Option<String>>,
     sender: Mutex<Option<Arc<RtpSender>>>,
     receiver: Mutex<Option<Arc<RtpReceiver>>>,
@@ -6252,6 +6336,7 @@ impl RtpTransceiver {
             id: TRANSCEIVER_COUNTER.fetch_add(1, Ordering::Relaxed),
             kind,
             direction: Mutex::new(direction),
+            desired_direction: Mutex::new(direction),
             mid: Mutex::new(None),
             sender: Mutex::new(None),
             receiver: Mutex::new(None),
@@ -6306,6 +6391,32 @@ impl RtpTransceiver {
 
     pub fn set_direction(&self, direction: TransceiverDirection) {
         *self.direction.lock() = direction;
+        *self.desired_direction.lock() = direction;
+    }
+
+    /// Record the direction carried by a remote description without touching
+    /// our own preferred (offer) direction.
+    fn set_remote_direction(&self, direction: TransceiverDirection) {
+        *self.direction.lock() = direction;
+    }
+
+    fn desired_direction(&self) -> TransceiverDirection {
+        *self.desired_direction.lock()
+    }
+
+    /// Adopt the direction of a local offer as our preference, unless it is
+    /// the preference itself or the downgrade create_offer applies while the
+    /// transceiver has no sender.
+    fn record_offered_direction(&self, offered: TransceiverDirection) {
+        let mut desired = self.desired_direction.lock();
+        let downgraded = match *desired {
+            TransceiverDirection::SendRecv => TransceiverDirection::RecvOnly,
+            TransceiverDirection::SendOnly => TransceiverDirection::Inactive,
+            other => other,
+        };
+        if offered != *desired && offered != downgraded {
+            *desired = offered;
+        }
     }
 
     pub fn mid(&self) -> Option<String> {
@@ -8700,7 +8811,9 @@ mod tests {
         pc.set_remote_description(offer.clone()).await.unwrap();
         let answer = pc.create_answer().await.unwrap();
         assert_eq!(answer.media_sections.len(), 1);
-        assert_eq!(answer.media_sections[0].direction, Direction::RecvOnly);
+        // A `sendonly` offer answered by a `sendonly` transceiver: neither
+        // side receives (RFC 3264 §6.1).
+        assert_eq!(answer.media_sections[0].direction, Direction::Inactive);
         pc.set_local_description(answer).unwrap();
         assert_eq!(pc.signaling_state(), SignalingState::Stable);
     }
