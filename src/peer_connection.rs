@@ -1498,12 +1498,52 @@ impl PeerConnection {
                 }
             }
         }
-        let mut local = self.inner.local_description.lock();
-        *local = Some(desc);
+        let applies_answer = matches!(desc.sdp_type, SdpType::Answer | SdpType::Pranswer);
+        *self.inner.local_description.lock() = Some(desc);
+        if applies_answer {
+            self.apply_negotiated_send_directions();
+        }
         Ok(())
     }
 
     pub async fn set_remote_description(&self, desc: SessionDescription) -> RtcResult<()> {
+        let applies_answer = matches!(desc.sdp_type, SdpType::Answer | SdpType::Pranswer);
+        self.apply_remote_description(desc).await?;
+        if applies_answer {
+            self.apply_negotiated_send_directions();
+        }
+        Ok(())
+    }
+
+    /// RFC 3264 §6.1 / §7, RFC 8829 §5.11: once an answer is applied, a
+    /// transceiver sends RTP only if our side of the negotiation sends and the
+    /// remote side receives.
+    fn apply_negotiated_send_directions(&self) {
+        let local = self.inner.local_description.lock().clone();
+        let remote = self.inner.remote_description.lock().clone();
+        let (Some(local), Some(remote)) = (local, remote) else {
+            return;
+        };
+        let local_sections = self.matched_rtp_media_sections(&local);
+        for (transceiver, remote_idx) in self.matched_rtp_media_sections(&remote) {
+            let Some(local_idx) = local_sections
+                .iter()
+                .find(|(t, _)| Arc::ptr_eq(t, &transceiver))
+                .map(|(_, idx)| *idx)
+            else {
+                continue;
+            };
+            let ours = &local.media_sections[local_idx];
+            let theirs = &remote.media_sections[remote_idx];
+            // Only the direction decides: port 0 is not treated as a
+            // rejection here (some WebRTC stacks answer port 0 with ICE).
+            let permitted = matches!(ours.direction, Direction::SendRecv | Direction::SendOnly)
+                && matches!(theirs.direction, Direction::SendRecv | Direction::RecvOnly);
+            transceiver.set_send_permitted(permitted);
+        }
+    }
+
+    async fn apply_remote_description(&self, desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
         let remote_dtls_fingerprint = if self.config().transport_mode == TransportMode::WebRtc {
             match desc.dtls_fingerprint() {
@@ -6103,6 +6143,8 @@ pub struct RtpTransceiver {
     /// Deferred sdes:mid configuration: stored here when update_extmap() is called
     /// but the sender has not been created yet.  Applied in set_sender().
     pending_sdes_mid: Mutex<Option<(u8, Arc<str>)>>,
+    /// Whether the last completed negotiation lets this transceiver send.
+    send_permitted: AtomicBool,
 }
 
 impl RtpTransceiver {
@@ -6124,6 +6166,7 @@ impl RtpTransceiver {
             payload_map: Arc::new(RwLock::new(HashMap::new())),
             extmap: Arc::new(RwLock::new(HashMap::new())),
             pending_sdes_mid: Mutex::new(None),
+            send_permitted: AtomicBool::new(true),
         }
     }
 
@@ -6202,6 +6245,8 @@ impl RtpTransceiver {
 
     pub fn set_sender(&self, sender: Option<Arc<RtpSender>>) {
         if let Some(ref s) = sender {
+            // Before the send loop can start below.
+            s.set_send_enabled(self.send_permitted.load(Ordering::Relaxed));
             // If transport is already established, connect the sender to it
             if let Some(weak_transport) = self.rtp_transport.lock().as_ref()
                 && let Some(transport) = weak_transport.upgrade()
@@ -6245,7 +6290,21 @@ impl RtpTransceiver {
                 }
             }
         }
-        *self.sender.lock() = sender;
+        // Again under the sender lock, so a concurrent set_send_permitted
+        // either sees this sender or has already stored the flag read here.
+        let mut current = self.sender.lock();
+        if let Some(ref s) = sender {
+            s.set_send_enabled(self.send_permitted.load(Ordering::Relaxed));
+        }
+        *current = sender;
+    }
+
+    fn set_send_permitted(&self, permitted: bool) {
+        let sender = self.sender.lock();
+        self.send_permitted.store(permitted, Ordering::Relaxed);
+        if let Some(sender) = sender.as_ref() {
+            sender.set_send_enabled(permitted);
+        }
     }
 
     /// Set the RTP transport reference. Called by start_dtls when transport is established.
@@ -6381,6 +6440,8 @@ pub struct RtpSender {
     sdes_mid: Arc<Mutex<Option<(u8, Arc<str>)>>>,
     transport_generation: Arc<AtomicU64>,
     transport_change_tx: watch::Sender<u64>,
+    /// Whether the negotiated direction lets this sender transmit RTP.
+    send_enabled: Arc<AtomicBool>,
     /// Correlation span of the owning PeerConnection; instrumented onto the
     /// send-loop task so its logs stay grouped with the rest of the session.
     pc_span: tracing::Span,
@@ -6533,9 +6594,16 @@ impl RtpSender {
             sdes_mid: Arc::new(Mutex::new(None)),
             transport_generation: Arc::new(AtomicU64::new(0)),
             transport_change_tx,
+            send_enabled: Arc::new(AtomicBool::new(true)),
             pc_span,
             runtime_handle,
         }
+    }
+
+    /// Enable or disable RTP transmission (RTCP is unaffected). Samples read
+    /// while disabled are dropped.
+    fn set_send_enabled(&self, enabled: bool) {
+        self.send_enabled.store(enabled, Ordering::Relaxed);
     }
 
     pub fn ssrc(&self) -> u32 {
@@ -6694,6 +6762,7 @@ impl RtpSender {
         let last_rtp_timestamp = self.last_rtp_timestamp.clone();
         let interceptors = self.interceptors.clone();
         let sdes_mid = self.sdes_mid.clone();
+        let send_enabled = self.send_enabled.clone();
         let mut rtcp_rx = self.rtcp_tx.subscribe();
 
         let pc_span = self.pc_span.clone();
@@ -6783,6 +6852,7 @@ impl RtpSender {
                             break;
                         }
                         match res {
+                            Ok(_) if !send_enabled.load(Ordering::Relaxed) => {}
                             Ok(mut sample) => {
                                 // Reload from the shared counter: rewrite/IVR handoff
                                 // updates it via note_external_packet / adopt while this
