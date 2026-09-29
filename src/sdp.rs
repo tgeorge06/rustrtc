@@ -8,6 +8,8 @@ use std::{
 
 pub const ABS_SEND_TIME_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
 pub const SDES_MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
+pub const TRANSPORT_CC_URI: &str =
+    "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -169,7 +171,8 @@ impl SessionDescription {
             for (media, has_direction) in media_sections.iter_mut().zip(&media_has_direction) {
                 // Not SCTP data channels: they ignore direction attributes
                 // (RFC 8841 §9.2).
-                if !has_direction && media.kind != MediaKind::Application {
+                let sctp = media.kind == MediaKind::Application && media.protocol.contains("SCTP");
+                if !has_direction && !sctp {
                     media.direction = session_direction;
                 }
             }
