@@ -7,73 +7,81 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 
 ## Features
 
-- **High performance** — ~2.7× faster than `webrtc-rs` and ~2.4× faster than `pion` (Go) in throughput, with ~30% less memory than `webrtc-rs` (see the benchmark below).
+- **High performance** — ~3.3× faster than `webrtc-rs` and ~3.2× faster than `pion` (Go) in throughput, with ~52% less memory than `webrtc-rs` (see the benchmark below).
 - **Full protocol stack** — WebRTC, RTP, SRTP, and **T.38 fax** in a single library, plus **UPnP IGD** NAT traversal. Few moving parts, no missing pieces.
 - **Unified `PeerConnection` API** — one interface for every transport mode (`WebRtc` ICE/DTLS/SRTP, `Srtp`, `Rtp`, and T.38). No fragmented APIs.
-- **WebRTC compliant** — interoperable with Chrome/WebRTC and pion; offer/answer, renegotiation, and standard SDP attributes.
-- **Complete media pipeline** — packetizer/depacketizer, jitter buffer, NACK/FIR/PLI, TWCC, and REMB for audio and video.
-- **Full ICE** — STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), and single-port UDP mux for SFU/WHEP deployments.
+- **WebRTC compliant** — interoperable with Chrome/WebRTC and pion; offer/answer, renegotiation, rollback, and standard SDP attributes.
+- **ICE restart** — `restart_ice()` for network migration / re-INVITE flows, with automatic detection of remote-initiated restarts (RFC 8445 §9).
+- **Complete media pipeline** — packetizer/depacketizer (VP8, VP9, H264, Opus, G.711/G.722/G.729), jitter buffer, NACK/RTX, FIR/PLI, TWCC, and REMB for audio and video.
+- **Bandwidth estimation (GCC)** — generates TWCC receiver feedback, stamps transport-wide sequence numbers on outbound RTP, and exposes a live `target_bitrate` estimate for encoder adaptation (`RtpSender::subscribe_target_bitrate`).
+- **Full ICE** — STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), single-port UDP mux for SFU/WHEP deployments, and **mDNS candidate obfuscation** (`enable_mdns`).
 - **NAT traversal & deployment** — RTP latching, UPnP IGD port mapping, and firewall-friendly port ranges (`rtp_start_port`/`rtp_end_port`).
 - **Production extras** — RTP rewrite bridge (SSRC/PT/sequence remapping) and a WebRTC-compatible stats model.
 
-## Benchmark game (rustrtc vs webrtc-rs & pion) in 0.3.114
+## Benchmark (rustrtc vs webrtc-rs & pion) in 0.3.141
 
-**CPU:**  `AMD Ryzen 7 5700X 8-Core Processor`
-**OS** `5.15.0-118-generic #128-Ubuntu`  
-**Compiler** `rustc 1.97.1 (8bab26f4f 2026-07-14)`,  `go version go1.23.0 linux/amd64`
+**CPU:** `Intel(R) Core(TM) i7-9700T CPU @ 2.00GHz` (8 cores)  
+**OS:** `Debian 13, 6.12.101+deb13-amd64`  
+**Compiler:** `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `go version go1.24.4 linux/amd64`
 
 ```shell
-nice@miuda.ai rustrtc % cargo run -r --example benchmark
+cargo run -r --example benchmark
 
 Comparison (Baseline: webrtc)
 Metric               | webrtc     | rustrtc    | pion      
 --------------------------------------------------------------------------------
-Duration (s)         | 10.02      | 10.02      | 10.08     
-Setup Latency (ms)   | 0.75       | 0.25       | 0.90      
-Throughput (MB/s)    | 280.13     | 825.45     | 310.14    
-Msg Rate (msg/s)     | 286850.22  | 845261.21  | 317586.71 
-CPU Usage (%)        | 1269.85    | 1530.65    | 1154.67   
-Memory (MB)          | 32.00      | 25.00      | 44.00     
+Duration (s)         | 10.07      | 10.24      | 10.07     
+Setup Latency (ms)   | 25.64      | 0.45       | 3.00      
+Throughput (MB/s)    | 165.98     | 549.04     | 169.58    
+Msg Rate (msg/s)     | 169967.13  | 562214.36  | 173647.96 
+CPU Usage (%)        | 677.95     | 739.62     | 555.20    
+Memory (MB)          | 44.00      | 21.00      | 48.00     
 --------------------------------------------------------------------------------
 
 Performance Charts
 ==================
 
 Throughput (MB/s) (Higher is better)
-webrtc     | ███████████████                          280.13
-rustrtc    | ████████████████████████████████████████ 825.45
-pion       | ████████████████                         310.14
+webrtc     | ████████████                             165.98
+rustrtc    | ████████████████████████████████████████ 549.04
+pion       | ████████████                             169.58
 
 Message Rate (msg/s) (Higher is better)
-webrtc     | ███████████████                          286850.22
-rustrtc    | ████████████████████████████████████████ 845261.21
-pion       | ████████████████                         317586.71
+webrtc     | ████████████                             169967.13
+rustrtc    | ████████████████████████████████████████ 562214.36
+pion       | ████████████                             173647.96
 
 Setup Latency (ms) (Lower is better)
-webrtc     | ████████████████████████████████████████ 0.75
-rustrtc    | ██████████████                           0.25
-pion       | ████████████████████████████████████████ 0.90
+webrtc     | ████████████████████████████████████████ 25.64
+rustrtc    |                                          0.45
+pion       | ████                                     3.00
 
 CPU Usage (%) (Lower is better)
-webrtc     | ████████████████████████████████████████ 1269.85
-rustrtc    | ████████████████████████████████████████ 1530.65
-pion       | ██████████████████████████████████       1154.67
+webrtc     | ████████████████████████████████████     677.95
+rustrtc    | ████████████████████████████████████████ 739.62
+pion       | ████████████████████████████████████████ 555.20
 
 Memory (MB) (Lower is better)
-webrtc     | ████████████████████████████████████████ 32.00
-rustrtc    | █████████████████████████████████        25.00
-pion       | ████████████████████████████████████████ 44.00
+webrtc     | ████████████████████████████████████████ 44.00
+rustrtc    | █████████████████                        21.00
+pion       | ████████████████████████████████████████ 48.00
 ```
 
 **Key Findings:**
 
-- **Throughput**: `rustrtc` is ~2.95x faster than `webrtc-rs` and ~2.7x faster than `pion`.
-- **Memory**: `rustrtc` uses ~22% less memory than `webrtc-rs` and ~43% less than `pion`.
-- **Setup Latency**: Significantly faster connection setup (0.25ms vs 0.75ms/0.90ms).
+- **Throughput**: `rustrtc` is ~3.3× faster than `webrtc-rs` and ~3.2× faster than `pion`.
+- **Memory**: `rustrtc` uses ~52% less memory than `webrtc-rs` and ~56% less than `pion`.
+- **Setup latency**: 0.45 ms — orders of magnitude faster than `webrtc-rs` (25.6 ms) and ~6.7×
+  faster than `pion` (3.0 ms).
+- **Efficiency per CPU**: 0.74 MB/s per CPU-percent vs 0.31 (pion) and 0.24 (webrtc-rs) —
+  `rustrtc` delivers ~2.3× more throughput per unit of CPU.
 
-> The `pion` numbers are from the previous benchmark run (0.3.113); `rustrtc` and `webrtc-rs`
-> were re-measured on the same machine for 0.3.114 after the SCTP congestion-window stall
-> and flow-control lost-wakeup fixes.
+**No regression with the new stack:** this run has the TWCC/GCC pipeline **active**
+(`enable_gcc = true`: transport-cc sequence stamping on every outbound packet plus
+receiver-side TWCC feedback generation), and throughput still holds 3.3× / 3.2× over
+`webrtc-rs` / `pion`. ICE restart, mDNS candidate obfuscation, and the VP9 codec are
+likewise pure add-ons — the ratios above are the stable signal across releases
+(0.3.114: 2.95× / 2.7×; 0.3.141: 3.3× / 3.2×).
 
 ## Usage
 
@@ -128,6 +136,24 @@ All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurat
 - **`enable_ice_lite`** — Enable ICE Lite mode.
 - **`ice_tcp_policy`** — `IceTcpPolicy::Disabled` (default), `IceTcpPolicy::Enabled`, or `IceTcpPolicy::PassiveOnly`. Controls ICE TCP candidate support per RFC 6544.
 - **`ice_udp_mux`** / **`ice_udp_mux_port`** — Share a single UDP socket across many `PeerConnection`s (single-port multiplexing for SFU/WHEP). Set `ice_udp_mux = true` and `ice_udp_mux_port = <port>`; incoming packets are demuxed by the server ufrag in the STUN Binding Request, then by remote source address.
+- **`enable_mdns`** — Advertise host candidates via mDNS (`<random>.local` hostnames instead of local IPs, draft-ietf-rtcweb-mdns). A built-in mDNS responder answers A/AAAA lookups; real addresses are kept internally so connectivity is unaffected. Default: `false`.
+
+### Bandwidth Estimation (GCC)
+- **`enable_gcc`** — TWCC + GCC loop (default: `true`): outbound RTP is stamped with transport-cc sequence numbers, TWCC feedback is generated for inbound streams, and each `RtpSender` publishes a bandwidth estimate. The library does not throttle sends itself — drive your encoder from `RtpSender::subscribe_target_bitrate()`:
+
+```rust
+let mut rx = sender.subscribe_target_bitrate().unwrap();
+while let Ok(new_bps) = rx.changed().await {
+    encoder.set_bitrate(*rx.borrow());
+}
+```
+
+### ICE Restart
+```rust
+pc.restart_ice().await?;      // rolls fresh ICE credentials (RFC 8445 §9)
+let offer = pc.create_offer().await?;  // carries the new ice-ufrag/pwd
+```
+Remote-initiated restarts (peer offers new credentials) are detected and mirrored automatically. DTLS/SRTP survive across the restart.
 
 ### UPnP
 - **`enable_upnp`** — Auto-map ports via UPnP IGD.
@@ -138,8 +164,9 @@ All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurat
 - **`probation_max_packets`** — Number of packets to observe before committing a latched address.
 
 ### Media Capabilities
-- **`media_capabilities`** — Configure audio/video/image (T.38) codecs and SCTP port via `MediaCapabilities`.
+- **`media_capabilities`** — Configure audio/video/image (T.38) codecs and SCTP port via `MediaCapabilities`. Video presets: `VideoCapability::default()` (VP8), `VideoCapability::vp9()` / `vp9_with_rtx(pt)` (RFC 9628), `VideoCapability::h264()`.
 - **`ssrc_start`** — Starting SSRC value for local tracks.
+- **`depacketizer_strategy`** — Pluggable per-kind depacketizer (e.g. `Vp9Depacketizer` for RFC 9628 VP9 reassembly).
 
 ### SCTP (Data Channels)
 - `sctp_rto_initial`, `sctp_rto_min`, `sctp_rto_max`, `sctp_max_association_retransmits`, `sctp_receive_window`, `sctp_heartbeat_interval`, `sctp_max_heartbeat_failures`, `sctp_max_burst`, `sctp_max_cwnd`

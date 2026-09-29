@@ -790,6 +790,44 @@ async fn test_reoffer_keeps_hold_from_hand_built_initial_offer() {
     assert_eq!(reoffer(&pc, Direction::RecvOnly).await, Direction::SendOnly);
 }
 
+/// Public-API contract behind the re-offer fix: `direction()` mirrors the
+/// direction carried by the last applied remote description, while the next
+/// offer carries our own preference. After answering a remote hold, the
+/// transceiver still reads the remote's `sendonly`, yet our re-offer says
+/// `sendrecv` — the offer no longer echoes what `direction()` holds.
+#[tokio::test]
+async fn test_direction_reads_current_direction_not_the_reoffer_preference() {
+    let pc = rtp_pc_with_audio_sender();
+    assert_eq!(
+        answer_remote_offer(&pc, Direction::SendOnly).await,
+        Direction::RecvOnly,
+        "a remote hold is answered recvonly"
+    );
+
+    let t = pc.get_transceivers()[0].clone();
+    assert_eq!(
+        t.direction(),
+        TransceiverDirection::SendOnly,
+        "direction() mirrors the remote offer's direction"
+    );
+    assert_eq!(
+        reoffer(&pc, Direction::SendOnly).await,
+        Direction::SendRecv,
+        "the re-offer carries our own preference, not direction()"
+    );
+    assert_eq!(
+        t.direction(),
+        TransceiverDirection::SendOnly,
+        "generating an offer does not touch direction()"
+    );
+
+    // set_direction sets the preference and is visible immediately; the next
+    // offer follows it.
+    t.set_direction(TransceiverDirection::RecvOnly);
+    assert_eq!(t.direction(), TransceiverDirection::RecvOnly);
+    assert_eq!(reoffer(&pc, Direction::RecvOnly).await, Direction::RecvOnly);
+}
+
 /// RFC 3264 §6.1 / RFC 8829 §5.3.1: an answer is the reverse of the offered
 /// direction limited to our own intent (`set_direction`), not a mirror of the
 /// offer. Holds we started survive the remote's offers.
@@ -816,6 +854,8 @@ async fn test_answer_combines_offer_with_local_direction() {
             expected,
             "local {local:?}, remote offered {offered:?}"
         );
+        // Answering keeps our preference: the next offer still carries it.
+        assert_eq!(reoffer(&pc, Direction::SendRecv).await, local.into());
     }
 }
 
@@ -869,40 +909,25 @@ async fn test_answer_directions_for_mid_less_m_lines() {
     assert_eq!(directions, vec![Direction::RecvOnly, Direction::SendOnly]);
 }
 
-/// Public-API contract behind the re-offer fix: `direction()` mirrors the
-/// direction carried by the last applied remote description, while the next
-/// offer carries our own preference. After answering a remote hold, the
-/// transceiver still reads the remote's `sendonly`, yet our re-offer says
-/// `sendrecv` — the offer no longer echoes what `direction()` holds.
+/// T.38 (`m=image`) answers follow the same rule, in both SIP transport modes.
 #[tokio::test]
-async fn test_direction_reads_current_direction_not_the_reoffer_preference() {
-    let pc = rtp_pc_with_audio_sender();
-    assert_eq!(
-        answer_remote_offer(&pc, Direction::SendOnly).await,
-        Direction::RecvOnly,
-        "a remote hold is answered recvonly"
-    );
-
-    let t = pc.get_transceivers()[0].clone();
-    assert_eq!(
-        t.direction(),
-        TransceiverDirection::SendOnly,
-        "direction() mirrors the remote offer's direction"
-    );
-    assert_eq!(
-        reoffer(&pc, Direction::SendOnly).await,
-        Direction::SendRecv,
-        "the re-offer carries our own preference, not direction()"
-    );
-    assert_eq!(
-        t.direction(),
-        TransceiverDirection::SendOnly,
-        "generating an offer does not touch direction()"
-    );
-
-    // set_direction sets the preference and is visible immediately; the next
-    // offer follows it.
-    t.set_direction(TransceiverDirection::RecvOnly);
-    assert_eq!(t.direction(), TransceiverDirection::RecvOnly);
-    assert_eq!(reoffer(&pc, Direction::RecvOnly).await, Direction::RecvOnly);
+async fn test_image_answer_combines_offer_with_local_direction() {
+    for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = mode.clone();
+        let pc = PeerConnection::new(config);
+        let raw = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\n\
+                   m=image 40000 udptl t38\r\na=T38FaxVersion:0\r\na=sendrecv\r\n";
+        let offer = SessionDescription::parse(SdpType::Offer, raw).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        let t = pc.get_transceivers()[0].clone();
+        t.set_direction(TransceiverDirection::RecvOnly);
+        let answer = pc.create_answer().await.unwrap();
+        assert_eq!(answer.media_sections[0].kind, MediaKind::Image);
+        assert_eq!(
+            answer.media_sections[0].direction,
+            Direction::RecvOnly,
+            "{mode:?}"
+        );
+    }
 }

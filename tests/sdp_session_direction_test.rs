@@ -1,7 +1,7 @@
 //! RFC 8866 §6.7 (RFC 4566 §6): a direction attribute at session level
 //! applies to every media section that does not carry its own.
 use rustrtc::sdp::{Direction, SdpType, SessionDescription};
-use rustrtc::{PeerConnection, RtcConfiguration, TransportMode};
+use rustrtc::{MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection, TransportMode};
 
 fn sdp(session_direction: Option<&str>, media_directions: &[Option<&str>]) -> String {
     let mut out = String::from("v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n");
@@ -53,15 +53,21 @@ fn media_level_direction_overrides_session_level() {
     );
 }
 
+/// T.38 `m=image` sections inherit it like audio; SCTP data channels do not.
 #[test]
-fn data_channel_sections_do_not_inherit_the_session_direction() {
+fn image_sections_inherit_and_data_channels_do_not() {
     let raw = format!(
-        "{}m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n",
+        "{}m=image 40002 udptl t38\r\na=T38FaxVersion:0\r\n\
+         m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n",
         sdp(Some("sendonly"), &[None])
     );
     assert_eq!(
         directions(&raw),
-        vec![Direction::SendOnly, Direction::SendRecv]
+        vec![
+            Direction::SendOnly,
+            Direction::SendOnly,
+            Direction::SendRecv
+        ]
     );
 }
 
@@ -83,19 +89,51 @@ fn reparsing_our_serialization_keeps_the_direction() {
     );
 }
 
-/// A SIP peer holds the call with a session-level `a=sendonly`: we answer
-/// `recvonly`, as for a media-level hold.
+/// A SIP peer holds the call with a session-level `a=sendonly`, in the
+/// initial offer or in a re-INVITE: we answer `recvonly`, as for a
+/// media-level hold, and `direction()` reads the remote's `sendonly`.
 #[tokio::test]
 async fn a_session_level_hold_is_answered_recvonly() {
+    for initial in [Some("sendonly"), None] {
+        let pc = PeerConnection::new(RtcConfiguration {
+            transport_mode: TransportMode::Rtp,
+            ..RtcConfiguration::default()
+        });
+        for session_direction in [initial, Some("sendonly")] {
+            let raw = sdp(session_direction, &[None]);
+            let offer = SessionDescription::parse(SdpType::Offer, &raw).expect("parse");
+            pc.set_remote_description(offer)
+                .await
+                .expect("remote offer");
+            let answer = pc.create_answer().await.expect("answer");
+            let expected = match session_direction {
+                Some(_) => Direction::RecvOnly,
+                None => Direction::SendRecv,
+            };
+            assert_eq!(answer.media_sections[0].direction, expected);
+            pc.set_local_description(answer).expect("local answer");
+        }
+        assert_eq!(
+            pc.get_transceivers()[0].direction(),
+            TransceiverDirection::SendOnly
+        );
+    }
+}
+
+/// A session-level direction in the remote answer is the answered direction.
+#[tokio::test]
+async fn a_session_level_direction_in_the_answer_applies() {
     let pc = PeerConnection::new(RtcConfiguration {
         transport_mode: TransportMode::Rtp,
         ..RtcConfiguration::default()
     });
-    let offer =
-        SessionDescription::parse(SdpType::Offer, &sdp(Some("sendonly"), &[None])).expect("parse");
-    pc.set_remote_description(offer)
+    let t = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+    let offer = pc.create_offer().await.expect("offer");
+    pc.set_local_description(offer).expect("local offer");
+    let raw = sdp(Some("recvonly"), &[None]).replace("PCMU/8000\r\n", "PCMU/8000\r\na=mid:0\r\n");
+    let answer = SessionDescription::parse(SdpType::Answer, &raw).expect("parse");
+    pc.set_remote_description(answer)
         .await
-        .expect("remote offer");
-    let answer = pc.create_answer().await.expect("answer");
-    assert_eq!(answer.media_sections[0].direction, Direction::RecvOnly);
+        .expect("remote answer");
+    assert_eq!(t.direction(), TransceiverDirection::RecvOnly);
 }
