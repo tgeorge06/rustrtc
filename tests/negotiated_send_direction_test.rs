@@ -190,6 +190,11 @@ async fn remote_hold_and_resume(mode: TransportMode) -> Result<()> {
 }
 
 #[tokio::test]
+async fn no_rtp_after_remote_answers_inactive_srtp() -> Result<()> {
+    no_rtp_after_remote_answers(TransportMode::Srtp, Direction::Inactive).await
+}
+
+#[tokio::test]
 async fn remote_hold_and_resume_rtp() -> Result<()> {
     remote_hold_and_resume(TransportMode::Rtp).await
 }
@@ -218,5 +223,62 @@ async fn a_sender_installed_after_an_inactive_answer_stays_quiet() -> Result<()>
     t1.set_sender(Some(sender));
     let _pump = Pump::start(source);
     assert!(!sends_within(&t1, Duration::from_millis(1500)).await);
+    Ok(())
+}
+
+/// Inside a BUNDLE group only the held m= line stops; its sibling on the same
+/// transport keeps sending.
+#[tokio::test]
+async fn one_held_stream_in_a_bundle_stops_alone() -> Result<()> {
+    let pc1 = pc(TransportMode::WebRtc);
+    let pc2 = pc(TransportMode::WebRtc);
+    let (held, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
+    pc1.add_track(track, opus())?;
+    let (open, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
+    pc1.add_track(track, opus())?;
+    exchange(&pc1, &pc2, Some(Direction::Inactive)).await?;
+    let answer = pc1.remote_description().expect("answer").to_sdp_string();
+    assert!(answer.contains("a=group:BUNDLE 0 1"), "{answer}");
+    tokio::try_join!(pc1.wait_for_connected(), pc2.wait_for_connected())?;
+    let (_held, _open) = (Pump::start(held), Pump::start(open));
+
+    let t1 = pc1.get_transceivers();
+    assert!(!sends_within(&t1[0], Duration::from_millis(1500)).await);
+    assert!(sends_within(&t1[1], Duration::from_millis(1500)).await);
+    Ok(())
+}
+
+/// The remote holds us; our ICE restart re-offer keeps the hold in force
+/// (the answer still says `sendonly` for the remote); the remote resumes and
+/// we send again over the restarted ICE session.
+#[tokio::test]
+async fn remote_hold_survives_our_ice_restart() -> Result<()> {
+    let pc1 = pc(TransportMode::WebRtc);
+    let pc2 = pc(TransportMode::WebRtc);
+    let (source, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
+    pc1.add_track(track, opus())?;
+    let (_back, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
+    pc2.add_track(track, opus())?;
+    exchange(&pc1, &pc2, None).await?;
+    tokio::try_join!(pc1.wait_for_connected(), pc2.wait_for_connected())?;
+    let _pump = Pump::start(source);
+    let t1 = pc1.get_transceivers()[0].clone();
+    let t2 = pc2.get_transceivers()[0].clone();
+
+    t2.set_direction(TransceiverDirection::SendOnly);
+    exchange(&pc2, &pc1, None).await?;
+    pc1.restart_ice().await?;
+    exchange(&pc1, &pc2, None).await?;
+    assert!(
+        !sends_within(&t1, Duration::from_millis(1500)).await,
+        "an ICE restart re-offer lifted the remote's hold"
+    );
+
+    t2.set_direction(TransceiverDirection::SendRecv);
+    exchange(&pc2, &pc1, None).await?;
+    assert!(
+        sends_within(&t1, Duration::from_millis(3000)).await,
+        "no RTP after the remote resumed"
+    );
     Ok(())
 }
