@@ -1545,8 +1545,6 @@ impl PeerConnection {
                 }
             }
         }
-        // Store through a temporary guard: apply_negotiated_send_directions
-        // re-locks local_description, so no guard may be held across it.
         *self.inner.local_description.lock() = Some(desc);
         if applies_answer {
             self.apply_negotiated_send_directions();
@@ -1572,6 +1570,8 @@ impl PeerConnection {
         let (Some(local), Some(remote)) = (local, remote) else {
             return;
         };
+        // Audio/video only: T.38 (UDPTL) and data channels are not sent by
+        // an RtpSender, and matched_rtp_media_sections skips them.
         let local_sections = self.matched_rtp_media_sections(&local);
         for (transceiver, remote_idx) in self.matched_rtp_media_sections(&remote) {
             let Some(local_idx) = local_sections
@@ -7124,10 +7124,10 @@ impl RtpSender {
         let last_rtp_timestamp = self.last_rtp_timestamp.clone();
         let interceptors = self.interceptors.clone();
         let sdes_mid = self.sdes_mid.clone();
-        let send_enabled = self.send_enabled.clone();
         let rtcp_enabled = self.rtcp_enabled.clone();
         let transport_cc_ext_id = self.transport_cc_ext_id.clone();
         let transport_cc_seq = self.transport_cc_seq.clone();
+        let send_enabled = self.send_enabled.clone();
         let mut rtcp_rx = self.rtcp_tx.subscribe();
 
         let pc_span = self.pc_span.clone();
